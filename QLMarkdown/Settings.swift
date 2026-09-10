@@ -412,8 +412,9 @@ class Settings: Codable {
         }
         set {
             // print("Rendered \(newValue) files.")
+            // No synchronize(): the counter is only read back on the next rendering, so forcing
+            // a synchronous write to disk on every preview is wasted work on the cold path.
             UserDefaults.standard.setValue(newValue, forKey: "ql-markdown-render-count")
-            UserDefaults.standard.synchronize();
         }
     }
     
@@ -1001,7 +1002,20 @@ class Settings: Codable {
     func getAppliedCSS() -> (bundled: String?, custom: String) {
         let custom = (self.customCSSFetched ? self.customCSSCode : self.getCustomCSSCode()) ?? ""
         let useBundled = !self.renderAsCode && (custom.isEmpty || !self.customCSSOverride)
-        return (useBundled ? self.getBundleContents(forResource: "default", ofType: "css") : nil, custom)
+        return (useBundled ? self.bundledCSS : nil, custom)
+    }
+    
+    private static var bundledCSSCache: String?
+    private static var bundledCSSLoaded = false
+    
+    /// Bundled `default.css`, read from the app bundle only once per process
+    /// (it cannot change while the app or the extension is running).
+    private var bundledCSS: String? {
+        if !Self.bundledCSSLoaded {
+            Self.bundledCSSCache = self.getBundleContents(forResource: "default", ofType: "css")
+            Self.bundledCSSLoaded = true
+        }
+        return Self.bundledCSSCache
     }
     
     /// Width of the column used by the style to lay out the content. `nil` if no style declares it.

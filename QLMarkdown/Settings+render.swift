@@ -69,6 +69,60 @@ extension Settings {
         return try self.render(text: markdown_string, filename: filename, baseDir: baseDir)
     }
     
+    // MARK: - Syntax highlight support
+    
+    /// Path of the `highlight` support folder, resolved once per process.
+    private static var highlightSupportPath: String?
+    
+    /// `true` after the `highlight` data dir has been initialized for this process.
+    private static var highlightSupportReady = false
+    
+    /**
+     * Prepare the `highlight` library for the current process.
+     *
+     * The support folder, its language definitions index and `filetypes.conf` never change while
+     * the app (or the extension) is running, so the initialization is done once instead of on
+     * every rendered file.
+     *
+     * - Returns: The path of the support folder, or `nil` if it is missing.
+     */
+    @discardableResult
+    func prepareHighlightSupport() -> String? {
+        if Self.highlightSupportReady, let path = Self.highlightSupportPath {
+            return path
+        }
+        
+        guard let path = getHighlightSupportPath() else {
+            os_log("Unable to found the `highlight` support dir!", log: OSLog.rendering, type: .error)
+            return nil
+        }
+        
+        if !Self.highlightSupportReady {
+            cmark_syntax_highlight_init("\(path)/".cString(using: .utf8))
+            Self.highlightSupportReady = true
+        }
+        Self.highlightSupportPath = path
+        return path
+    }
+    
+    /**
+     * Cheap check whether the markdown source can contain a fenced or an indented code block.
+     *
+     * Highlighting is the most expensive part of a rendering, so all the syntax highlight
+     * machinery is skipped when the document has no code at all. The check is intentionally
+     * permissive (an indented continuation line also matches), so it can only cost the work of
+     * the correct highlight path, never lose a highlighted block.
+     */
+    static func mayContainCodeBlock(_ text: String) -> Bool {
+        if text.contains("```") || text.contains("~~~") {
+            return true
+        }
+        if text.hasPrefix("    ") || text.hasPrefix("\t") {
+            return true
+        }
+        return text.contains("\n    ") || text.contains("\n\t")
+    }
+    
     /**
      * Render the markdown to an html fragment.
      * - parameters:
@@ -409,13 +463,14 @@ extension Settings {
             }
         }
         
-        if self.syntaxHighlightExtension {
+        // Skipping the highlight extension on a document without code blocks also skips its
+        // initialization (the support folder scan and `filetypes.conf`), the post-processing
+        // walk over the parsed tree and the style sheet lookup.
+        let usesSyntaxHighlight = self.syntaxHighlightExtension && Self.mayContainCodeBlock(text)
+        
+        if usesSyntaxHighlight {
             if let ext = cmark_find_syntax_extension("syntaxhighlight") {
-                if let path = getHighlightSupportPath() {
-                    cmark_syntax_highlight_init("\(path)/".cString(using: .utf8))
-                } else {
-                    os_log("Unable to found the `highlight` support dir!", log: OSLog.rendering, type: .error)
-                }
+                prepareHighlightSupport()
                 
                 cmark_syntax_extension_highlight_set_theme_name(ext, "")
                 cmark_syntax_extension_highlight_set_background_color(ext, nil /* "var(--hl_Background)" */)
@@ -453,6 +508,12 @@ extension Settings {
             } else {
                 os_log("Could not enable markdown `syntax highlight` extension!", log: OSLog.rendering, type: .error)
             }
+        } else if let ext = cmark_find_syntax_extension("syntaxhighlight") {
+            // The document has no code block (or the extension is disabled): the highlight
+            // extension is not attached, so its counters are not reset by the post-processing.
+            // Clear them here, otherwise the style sheet of a previous preview would be emitted
+            // for this document too.
+            cmark_syntax_extension_highlight_set_rendered_count(ext, 0)
         }
         
         cmark_parser_feed(parser, md_text, strlen(md_text))
@@ -465,7 +526,7 @@ extension Settings {
         
         let about = self.about ? "<div style='font-size: 72%; margin-top: 1.5em; padding-top: .5em; -webkit-user-select: none;'><hr style='height: 0; border: none; border-top: 1px solid rgba(0,0,0,.5); box-shadow: 0 1px 1px rgba(255, 255, 255, .5)'/>\(Self.aboutInfo)</div>\n" : ""
         
-        let html_debug = self.renderDebugInfo(baseDir: baseDir)
+        let html_debug = self.renderDebugInfo(baseDir: baseDir, syntaxHighlightApplied: usesSyntaxHighlight)
         // Render
         if let html2 = cmark_render_html(doc, options, cmark_parser_get_syntax_extensions(parser)) {
             defer {
@@ -544,7 +605,7 @@ extension Settings {
      * - parameters:
      *   - baseDir: Path to the folder containing the source file. Used to manage relative paths within the code.
      */
-    internal func renderDebugInfo(baseDir: String) -> String {
+    internal func renderDebugInfo(baseDir: String, syntaxHighlightApplied: Bool = true) -> String {
         guard debug else {
             return ""
         }
@@ -687,6 +748,10 @@ table.debug td {
         html_debug += "<tr><td>syntax highlighting extension</td><td>"
         if self.syntaxHighlightExtension {
             html_debug += "on " + (cmark_find_syntax_extension("syntaxhighlight") == nil ? " (NOT AVAILABLE" : "")
+            if !syntaxHighlightApplied {
+                // The extension is enabled but not attached to this document: it has no code block.
+                html_debug += " (skipped: no code block in this file)"
+            }
             
             html_debug += "<table>\n"
             html_debug += "<tr><td>datadir</td><td>\(getHighlightSupportPath() ?? "missing")</td></tr>\n"
@@ -771,11 +836,7 @@ table.debug td {
      *   - baseDir: Path to the folder containing the source file. Used to manage relative paths within the code.
      */
     func renderAsSourceCode(text: String, baseDir: String) -> String? {
-        if let path = getHighlightSupportPath() {
-            cmark_syntax_highlight_init("\(path)/".cString(using: .utf8))
-        } else {
-            os_log("Unable to found the `highlight` support dir!", log: OSLog.rendering, type: .error)
-        }
+        prepareHighlightSupport()
         
         let isLight: Bool
         switch self.appearance {
