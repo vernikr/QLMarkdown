@@ -2,7 +2,7 @@
 #
 # Check the QLMarkdown Quick Look preview on a live system.
 #
-#     Scripts/qlpreview-check.sh [--app PATH] [--files FILE ...] [--keep] [--no-clear]
+#     Scripts/qlpreview-check.sh [--app PATH] [--files FILE ...] [--profile] [--keep] [--no-clear]
 #
 # What it does:
 #   1. registers the Quick Look extension of the given application for the current user,
@@ -20,6 +20,9 @@
 # Options:
 #   --app PATH       Application to test (default: /Applications/QLMarkdown.app).
 #   --files F ...    Documents to preview (default: two generated sample files).
+#   --profile        Also print where the cold start of the extension process goes, phase by
+#                    phase, from the signposts the extension logs at the debug level. The labels
+#                    are in `QLExtension/PreviewViewController.swift`.
 #   --keep           Leave the plugin registration pointing to the tested application.
 #   --no-clear       Do not empty the cache folder before the first round.
 #
@@ -32,6 +35,7 @@ APP="${APP:-/Applications/QLMarkdown.app}"
 FILES=()
 KEEP=0
 CLEAR=1
+PROFILE=0
 PANEL_SECONDS=7
 # Where the extension keeps the cached documents: its own container, and (for older layouts or a
 # hand copied application) the containers that may hold it too.
@@ -41,7 +45,7 @@ CACHE_DIRS=(
     "$HOME/Library/Group Containers/group.org.sbarex.qlmarkdown/Library/Application Support/preview-cache"
 )
 TMP_DIR=""
-LOG_PID=""
+LOG_PIDS=()
 LOGS_DIR=""
 RESTORE_APPEX=""
 FAILURES=0
@@ -60,6 +64,7 @@ while [[ $# -gt 0 ]]; do
                 shift
             done
             ;;
+        --profile) PROFILE=1; shift ;;
         --keep) KEEP=1; shift ;;
         --no-clear) CLEAR=0; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -99,10 +104,27 @@ register_with_launch_services() {
 banner() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
 stop_log() {
-    [[ -n "$LOG_PID" ]] || return 0
-    kill "$LOG_PID" >/dev/null 2>&1
-    wait "$LOG_PID" 2>/dev/null
-    LOG_PID=""
+    local pid
+    for pid in "${LOG_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill "$pid" >/dev/null 2>&1
+        wait "$pid" 2>/dev/null
+    done
+    LOG_PIDS=()
+}
+
+start_log() { # $1: file of the extension log, $2: file of the process log
+    # The debug level carries the cold start signposts; it only adds them, not the level of noise a
+    # debug stream usually brings, because the predicate is restricted to the subsystem of the app.
+    local level=info
+    [[ "$PROFILE" -eq 1 ]] && level=debug
+    log stream --predicate "subsystem == \"org.sbarex.QLMarkdown\"" --level "$level" --style compact >"$1" 2>&1 &
+    LOG_PIDS+=($!)
+    # The process life cycle (and so when Quick Look actually starts the extension) is logged by
+    # RunningBoard, not by the extension itself.
+    log stream --predicate "subsystem == \"com.apple.runningboard\"" --level default --style compact >"$2" 2>&1 &
+    LOG_PIDS+=($!)
+    sleep 1
 }
 
 cleanup() {
@@ -160,14 +182,13 @@ run_round() {
     local label="$1"; shift
     local appex; appex="$(appex_path)"
     local round_log="$TMP_DIR/round-${label//\//-}.log"
+    local round_spawn_log="$TMP_DIR/round-${label//\//-}-spawn.log"
 
     pkill -f "Markdown QL Extension" >/dev/null 2>&1
     sleep 1
 
-    # The log is captured for this round only, and the stream is closed before reading the file.
-    log stream --predicate "subsystem == \"org.sbarex.QLMarkdown\"" --level info --style compact >"$round_log" 2>&1 &
-    LOG_PID=$!
-    sleep 1
+    # The logs are captured for this round only, and the streams are closed before reading them.
+    start_log "$round_log" "$round_spawn_log"
 
     local round_start; round_start="$(now)"
 
@@ -195,12 +216,52 @@ run_round() {
         fi
     fi
 
-    report_round "$round_log" "$round_start"
+    report_round "$round_log" "$round_start" "$round_spawn_log"
+    [[ "$PROFILE" -eq 1 ]] && report_phases "$round_log"
     ROUND_LOG="$round_log"
 }
 
+# Where the time of a preview goes inside the extension process: the delay between the signposts it
+# logs, and the same delay counted from the start of the process.
+report_phases() {
+    local log="$1"
+    python3 - "$log" <<'PY' 2>/dev/null
+import datetime, re, sys
+stamp_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
+marks = []
+for line in open(sys.argv[1], errors="replace"):
+    match = stamp_re.match(line)
+    if not match or "mark " not in line:
+        continue
+    stamp = datetime.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f").timestamp()
+    label = line.rstrip().split("mark ", 1)[1]
+    marks.append((stamp, label))
+if len(marks) < 2:
+    print("  no profile signposts were logged (an ordinary preview does not log them)")
+    sys.exit()
+print("  %-34s %9s %12s" % ("phase", "step", "from start"))
+print("  %-34s %9s %12s" % ("---------------------------------", "--------", "-----------"))
+print()
+# Quick Look builds a fresh view controller (and so a fresh web view) for every document it is
+# asked to preview, so the signposts restart: a group per document.
+groups = []
+for stamp, label in marks:
+    if label == "loadView:begin" or not groups:
+        groups.append([])
+    groups[-1].append((stamp, label))
+for index, group in enumerate(groups):
+    if index:
+        print()
+    base = group[0][0]
+    previous = base
+    for stamp, label in group:
+        print("  %-34s %6.0f ms %9.0f ms" % (label, (stamp - previous) * 1000, (stamp - base) * 1000))
+        previous = stamp
+PY
+}
+
 report_round() {
-    local log="$1" start="$2"
+    local log="$1" start="$2" spawn_log="${3:-}"
 
     local cold
     cold="$(python3 - "$start" "$log" <<'PY' 2>/dev/null || echo n/a
@@ -216,6 +277,28 @@ for line in open(sys.argv[2], errors="replace"):
 PY
 )"
     [[ -n "$cold" ]] && echo "  extension cold start: ${cold} ms (from qlmanage to the first rendering)"
+
+    # Where the cold start goes: the part before the extension process exists belongs to Quick Look
+    # (qlmanage or Finder, the preview service, the plug-in lookup), the rest is the process launch
+    # (exec, dyld, the extension bootstrap) and what the extension itself does.
+    if [[ -n "$spawn_log" && -f "$spawn_log" ]]; then
+        python3 - "$start" "$cold" "$spawn_log" <<'PY' 2>/dev/null
+import datetime, re, sys
+started = float(sys.argv[1])
+cold = sys.argv[2]
+stamp_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
+spawn = None
+for line in open(sys.argv[3], errors="replace"):
+    match = stamp_re.match(line)
+    if match and "org.sbarex.QLMarkdown.QLExtension" in line:
+        spawn = datetime.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f").timestamp()
+        break
+if spawn:
+    print("  Quick Look before the extension process: %.0f ms" % ((spawn - started) * 1000))
+    if cold.isdigit():
+        print("  extension process to the first rendering: %.0f ms" % (int(cold) - (spawn - started) * 1000))
+PY
+    fi
 
     printf '  %-28s %-8s %s\n' "document" "cached" "rendering"
     printf '  %-28s %-8s %s\n' "----------------------------" "------" "---------"

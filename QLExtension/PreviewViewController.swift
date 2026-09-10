@@ -11,6 +11,19 @@ import Quartz
 import OSLog
 import external_launcher
 
+/**
+ * Signpost of the cold start, so that the time a preview takes can be broken down into phases:
+ *
+ *     Scripts/qlpreview-check.sh --profile
+ *
+ * The marks are logged at the *debug* level: a log stream only records them when it is asked for
+ * the debug level, so an ordinary preview neither prints them nor spends anything on them (the
+ * labels are short enough to be small strings, so building them does not allocate).
+ */
+func logColdStartMark(_ label: String) {
+    os_log("%{public}s", log: OSLog.quickLookExtension, type: .debug, "mark " + label)
+}
+
 class MyWKWebView: WKWebView {
     override var canBecomeKeyView: Bool {
         return false
@@ -310,7 +323,9 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     }
 
     override func loadView() {
+        logColdStartMark("loadView:begin")
         super.loadView()
+        logColdStartMark("loadView:after-super")
 
         // Paint the loading sheet with the current system appearance (dark in dark
         // mode) instead of the default white, so the preview does not flash a white
@@ -319,6 +334,7 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         self.view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
         Settings.shared.startMonitorChange()
+        logColdStartMark("loadView:after-monitor")
 
         if #available(macOS 11, *) {
             let connection = NSXPCConnection(serviceName: "org.sbarex.qlmarkdown.external-launcher")
@@ -330,10 +346,12 @@ class PreviewViewController: NSViewController, QLPreviewingController {
                 print("Received error:", error)
             } as? ExternalLauncherProtocol
         }
+        logColdStartMark("loadView:after-xpc")
 
         let settings = Settings.shared
 
         self.preferredContentSize = Self.previewContentSize
+        logColdStartMark("loadView:after-settings")
 
         let previewRect: CGRect
         if #available(macOS 11, *) {
@@ -344,11 +362,13 @@ class PreviewViewController: NSViewController, QLPreviewingController {
 
         // Create a configuration for the preferences
         let configuration = WKWebViewConfiguration()
+        logColdStartMark("loadView:after-config")
         // Enable JavaScript for unsafe HTML with inline images, or when Mermaid/Math extensions are active
         configuration.preferences.javaScriptEnabled = (settings.unsafeHTMLOption && settings.inlineImageExtension) || !settings.mermaidExtension.isDisabled || !settings.mathExtension.isDisabled
         configuration.allowsAirPlayForMediaPlayback = false
 
         self.webView = MyWKWebView(frame: previewRect, configuration: configuration)
+        logColdStartMark("loadView:after-webview")
         self.webView!.autoresizingMask = [.height, .width]
 
         self.webView!.wantsLayer = true
@@ -373,6 +393,7 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         }
 
         self.view.addSubview(self.webView!)
+        logColdStartMark("loadView:end")
     }
 
     internal func getBundleContents(forResource: String, ofType: String) -> String?
@@ -398,7 +419,9 @@ class PreviewViewController: NSViewController, QLPreviewingController {
 
             let html = try renderMD(url: url)
             self.webView?.isHidden = true // hide the webview until complete rendering
+            logColdStartMark("prepare:loadHTMLString-begin")
             self.webView?.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
+            logColdStartMark("prepare:loadHTMLString-end")
         } catch {
             handler(error)
         }
@@ -492,6 +515,7 @@ class PreviewViewController: NSViewController, QLPreviewingController {
 
 extension PreviewViewController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        logColdStartMark("webview:didFinish")
         if let handler = self.handler {
             handler(nil)
             self.handler = nil
@@ -500,6 +524,7 @@ extension PreviewViewController: WKNavigationDelegate {
         // Wait to show the webview to prevent a resize glitch.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             self.webView?.isHidden = false
+            logColdStartMark("webview:unhidden")
         }
     }
 

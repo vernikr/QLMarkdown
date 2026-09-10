@@ -11,6 +11,9 @@ Performance:
 - The bundled `default.css` is read from the app bundle only once per process.
 - The rendered-files counter no longer forces a synchronous write to disk on every preview.
 
+Diagnostics:
+- The cold start of a preview can be measured phase by phase: the extension logs signposts at the debug level (invisible and free in an ordinary session) and `Scripts/qlpreview-check.sh --profile` prints them next to the time Quick Look took before the extension process existed.
+
 
 ### 1.5.3 (54)
 New Features:

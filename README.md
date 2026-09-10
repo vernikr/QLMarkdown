@@ -431,6 +431,23 @@ Scripts/qlpreview-check.sh --app "/path/to/QLMarkdown.app"
 Scripts/qlpreview-check.sh --app "/path/to/QLMarkdown.app" --files ~/Documents/note.md --no-clear
 ```
 
+With `--profile` it also prints where the cold start of the extension process goes, phase by phase, from the signposts the extension logs at the debug level (`QLExtension/PreviewViewController.swift` knows what each label means):
+
+```
+  Quick Look before the extension process: 871 ms
+  extension process to the first rendering: 936 ms
+  phase                                   step   from start
+  ---------------------------------   --------  -----------
+
+  loadView:begin                          0 ms         0 ms
+  loadView:after-super                    4 ms         4 ms
+  loadView:after-settings                14 ms        27 ms
+  loadView:after-webview                220 ms       249 ms   <- the first web view also starts the WebKit processes
+  prepare:loadHTMLString-begin           66 ms       315 ms
+  webview:didFinish                     814 ms      1182 ms   <- the web content process and the first layout
+  webview:unhidden                      102 ms      1284 ms   <- a deliberate wait before showing the page
+```
+
 The logs of the extension are read from the unified log:
 
 ```sh
