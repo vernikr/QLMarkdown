@@ -46,6 +46,7 @@ You can download the last compiled release from [this link](https://github.com/s
   - [Shortcut Commands](#shortcut-commands)
   - [Build from source](#build-from-source)
     - [Dependency](#dependency)
+    - [Checking the preview](#checking-the-preview)
   - [FAQ](#faq)
   - [Note about security](#note-about-security)
   - [Note about the developer](#note-about-the-developer)
@@ -419,6 +420,22 @@ brew install autoconf automake libtool
 ``` 
 
 The compilation of `cmark-gfm` require `cmake` (`brew install cmake`). 
+
+
+### Checking the preview
+
+`Scripts/qlpreview-check.sh` checks the Quick Look preview on a live system (a GUI session is required): it registers the extension of the given application, runs two preview sessions with `qlmanage`, reports the cold start, the time every document took to be prepared and whether it came from the cache, and finally restores the plugin registration that was in use before.
+
+```sh
+Scripts/qlpreview-check.sh --app "/path/to/QLMarkdown.app"
+Scripts/qlpreview-check.sh --app "/path/to/QLMarkdown.app" --files ~/Documents/note.md --no-clear
+```
+
+The logs of the extension are read from the unified log:
+
+```sh
+log stream --predicate 'subsystem == "org.sbarex.QLMarkdown"' --level info --style compact
+```
 
 
 ## Note about security
