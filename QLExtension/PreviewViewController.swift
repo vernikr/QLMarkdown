@@ -23,57 +23,131 @@ class MyWKWebView: WKWebView {
 }
 
 /**
- * In-memory cache of the documents rendered by this process.
+ * Cache of the documents already rendered, so that showing a document again does not parse and
+ * highlight the Markdown from scratch.
  *
- * Quick Look keeps the extension process alive between previews, and the same file is often
- * previewed more than once (the panel is closed and reopened, or the user moves back and forth in
- * the gallery). Parsing and highlighting the Markdown is by far the most expensive part of showing
- * a preview, so the rendered body is reused while the source file and the settings are unchanged.
+ * Quick Look asks for the same document more than once (moving back and forth inside a panel) and
+ * starts a new extension process for every panel, so the cache has two levels: the in-memory
+ * entries of the current process and one small file per document inside the app group container,
+ * which is what makes a preview fast again after the extension has been restarted.
+ *
+ * An entry is reused only while everything its body was built from is unchanged: the source file
+ * (modification date and size), the settings (fingerprinted) and, in `Render as code` mode, the
+ * system appearance. Documents with local images embedded in the body are never cached.
  */
-final class RenderedBodyCache {
-    static let shared = RenderedBodyCache()
+final class RenderedDocumentCache {
+    static let shared = RenderedDocumentCache()
     
-    /// Number of rendered documents kept in memory.
-    private let capacity = 8
-    /// Biggest body worth keeping (a few MB of HTML is already an unusually large document).
+    /// Number of documents kept in memory.
+    private let memoryCapacity = 8
+    /// Biggest body worth caching (a few MB of HTML is already an unusually large document).
     private let maxBodyLength = 4 << 20
+    /// A cached document is dropped after this long without being previewed again.
+    private let maxAge: TimeInterval = 7 * 24 * 60 * 60
+    /// The cleanup keeps the cache folder below this size...
+    private let maxDiskSize = 64 << 20
+    /// ...and below this number of documents.
+    private let maxDiskEntries = 200
     
-    private struct Key: Equatable {
+    /// Everything the rendered body depends on.
+    struct Key: Equatable, Codable {
         let path: String
-        let modified: Date?
+        /// Modification date of the source file, in milliseconds since 1970 (an integer, so that
+        /// it survives the encoding on disk exactly).
+        let modified: Int?
         let size: Int
-        let settingsRevision: Int
+        /// Fingerprint of the settings used for the rendering.
+        let settings: String
         /// The system appearance, but only when the rendering depends on it (`renderAsCode`).
         let lightAppearance: Bool?
     }
     
-    private struct Entry {
+    private struct Entry: Codable {
         let key: Key
         let body: String
     }
     
     /// Entries ordered from the most to the least recently used.
-    private var entries: [Entry] = []
+    private var memory: [Entry] = []
+    
+    /// Used to keep the cleanup (file deletions) out of the preview path.
+    private let cleanupQueue = DispatchQueue(label: "org.sbarex.QLMarkdown.preview-cache", qos: .utility)
+    private var isCleaningUp = false
+    
+    // MARK: - Cache key
     
     /**
-     * Body of the last rendering of the file, or `nil` if the file must be rendered again.
+     * Key of the document: it changes as soon as one of the inputs of the rendering changes.
      */
-    func body(for url: URL, settings: Settings) -> String? {
-        let key = Self.key(for: url, settings: settings)
-        guard let index = entries.firstIndex(where: { $0.key == key }) else {
+    func key(for url: URL, settings: Settings) -> Key {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        return Key(
+            path: url.path,
+            modified: values?.contentModificationDate.map { Int(($0.timeIntervalSince1970 * 1000).rounded()) },
+            size: values?.fileSize ?? -1,
+            settings: Self.fingerprint(of: settings),
+            lightAppearance: settings.renderAsCode ? Settings.isLightAppearance : nil
+        )
+    }
+    
+    /**
+     * Fingerprint of every setting a rendering depends on.
+     *
+     * The settings are encoded with sorted keys so that the fingerprint is the same in every
+     * process (the cache on disk is shared with the next runs of the extension).
+     */
+    private static func fingerprint(of settings: Settings) -> String {
+        var text = ""
+        if let data = try? Self.encoder.encode(settings) {
+            text = Self.fnv1a(data)
+        }
+        let info = Settings.getResourceBundle().infoDictionary
+        let version = "\(info?["CFBundleShortVersionString"] as? String ?? "?").\(info?["CFBundleVersion"] as? String ?? "?")"
+        return "\(text)-\(version)"
+    }
+    
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+    
+    /// Stable hash (FNV-1a, 64 bit) of the given bytes; unlike `Hasher` it is the same in every
+    /// process, which is required for the cache file names.
+    private static func fnv1a<Bytes: Sequence>(_ bytes: Bytes) -> String where Bytes.Element == UInt8 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in bytes {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x00000100000001b3
+        }
+        return String(hash, radix: 16)
+    }
+    
+    // MARK: - Lookup and store
+    
+    /**
+     * Body of the last rendering of the document, or `nil` if it must be rendered again.
+     */
+    func body(for key: Key) -> String? {
+        if let index = memory.firstIndex(where: { $0.key == key }) {
+            let entry = memory.remove(at: index)
+            memory.insert(entry, at: 0)
+            return entry.body
+        }
+        
+        guard let entry = self.entry(onDisk: key) else {
             return nil
         }
-        let entry = entries.remove(at: index)
-        entries.insert(entry, at: 0)
+        keepInMemory(entry)
         return entry.body
     }
     
     /**
-     * Store the body rendered for the file, unless it is not worth (or not safe) to cache.
+     * Store the body rendered for the document, unless it is not worth (or not safe) to cache.
      */
-    func store(body: String, for url: URL, settings: Settings) {
-        // A body with embedded local images is not cached: the images are not part of the cache
-        // key, so editing one of them would keep showing the old picture.
+    func store(body: String, for key: Key) {
+        // A body with local images embedded in it is not cached: the images are not part of the
+        // cache key, so editing one of them would keep showing the old picture.
         guard !body.contains("data:image/") else {
             return
         }
@@ -81,23 +155,129 @@ final class RenderedBodyCache {
             return
         }
         
-        let key = Self.key(for: url, settings: settings)
-        entries.removeAll { $0.key == key }
-        entries.insert(Entry(key: key, body: body), at: 0)
-        if entries.count > capacity {
-            entries.removeLast(entries.count - capacity)
+        let entry = Entry(key: key, body: body)
+        keepInMemory(entry)
+        store(entry, onDisk: key)
+        scheduleCleanup()
+    }
+    
+    private func keepInMemory(_ entry: Entry) {
+        memory.removeAll { $0.key == entry.key }
+        memory.insert(entry, at: 0)
+        if memory.count > memoryCapacity {
+            memory.removeLast(memory.count - memoryCapacity)
         }
     }
     
-    private static func key(for url: URL, settings: Settings) -> Key {
-        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-        return Key(
-            path: url.path,
-            modified: values?.contentModificationDate,
-            size: values?.fileSize ?? -1,
-            settingsRevision: Settings.revision,
-            lightAppearance: settings.renderAsCode ? Settings.isLightAppearance : nil
-        )
+    // MARK: - Disk level
+    
+    /**
+     * Folder with the cached documents, inside the container of the extension.
+     *
+     * The container of the extension is used instead of the app group container because the
+     * sandbox allows the extension to read the shared container but not to write in it (the group
+     * container belongs to the main application), and because nothing else than the extension has
+     * to read this cache.
+     */
+    private static let folderURL: URL? = {
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let folder = caches.appendingPathComponent("preview-cache", isDirectory: true)
+        os_log("Preview cache folder: %{public}s", log: OSLog.quickLookExtension, type: .info, folder.path)
+        return folder
+    }()
+    
+    /// File of the given document. One file per document, so that an entry is overwritten instead
+    /// of piling up every time the document changes.
+    private func fileURL(for key: Key) -> URL? {
+        return Self.folderURL?.appendingPathComponent("preview-\(Self.fnv1a(key.path.utf8)).json")
+    }
+    
+    private func entry(onDisk key: Key) -> Entry? {
+        guard let url = fileURL(for: key), let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        guard let entry = try? JSONDecoder().decode(Entry.self, from: data) else {
+            // Unreadable (or older format) entry: drop it and render the document again.
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        guard entry.key == key, entry.body.utf8.count <= maxBodyLength else {
+            return nil
+        }
+        return entry
+    }
+    
+    private func store(_ entry: Entry, onDisk key: Key) {
+        guard let url = fileURL(for: key), let folder = Self.folderURL else {
+            return
+        }
+        guard let data = try? JSONEncoder().encode(entry) else {
+            return
+        }
+        
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: folder.path) {
+            try? fileManager.createDirectory(at: folder, withIntermediateDirectories: true, attributes: nil)
+        }
+        try? data.write(to: url, options: .atomic)
+    }
+    
+    /// Drop the entries that were not used for a long time and keep the folder within its budget.
+    /// Runs off the preview path, and never blocks it.
+    private func scheduleCleanup() {
+        cleanupQueue.async { [weak self] in
+            guard let self, !self.isCleaningUp else {
+                return
+            }
+            self.isCleaningUp = true
+            defer { self.isCleaningUp = false }
+            self.cleanup()
+        }
+    }
+    
+    private func cleanup() {
+        guard let folder = Self.folderURL else {
+            return
+        }
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        
+        let now = Date()
+        var stored: [(url: URL, modified: Date, size: Int)] = []
+        var totalSize = 0
+        
+        for file in files where file.pathExtension == "json" {
+            guard let values = try? file.resourceValues(forKeys: keys) else {
+                continue
+            }
+            let modified = values.contentModificationDate ?? now
+            let size = values.fileSize ?? 0
+            if now.timeIntervalSince(modified) > maxAge {
+                try? FileManager.default.removeItem(at: file)
+                continue
+            }
+            totalSize += size
+            stored.append((file, modified, size))
+        }
+        
+        // Remove the least recently used entries until the folder fits its budget again.
+        var count = stored.count
+        for entry in stored.sorted(by: { $0.modified < $1.modified }) {
+            guard count > maxDiskEntries || totalSize > maxDiskSize else {
+                break
+            }
+            try? FileManager.default.removeItem(at: entry.url)
+            totalSize -= entry.size
+            count -= 1
+        }
     }
 }
 
@@ -252,9 +432,13 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         let settings = Settings.shared
         Settings.renderStats += 1
 
+        let start = CFAbsoluteTimeGetCurrent()
         let markdown_url = Settings.getMarkdownFile(from: url)
+        let cacheKey = RenderedDocumentCache.shared.key(for: markdown_url, settings: settings)
         var text: String
-        if let cached = RenderedBodyCache.shared.body(for: markdown_url, settings: settings) {
+        var isCached = 0
+        if let cached = RenderedDocumentCache.shared.body(for: cacheKey) {
+            isCached = 1
             os_log(
                 "Reusing the cached rendering of file %{public}s",
                 log: OSLog.quickLookExtension,
@@ -264,7 +448,7 @@ class PreviewViewController: NSViewController, QLPreviewingController {
             text = cached
         } else {
             text = try settings.render(file: markdown_url, baseDir: markdown_url.deletingLastPathComponent().path)
-            RenderedBodyCache.shared.store(body: text, for: markdown_url, settings: settings)
+            RenderedDocumentCache.shared.store(body: text, for: cacheKey)
         }
         
         if Settings.renderStats > 0 && Settings.renderStats % 100 == 0 {
@@ -292,6 +476,15 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         }
 
         let html = settings.getCompleteHTML(title: url.lastPathComponent, body: text)
+
+        os_log(
+            "Preview of %{public}s ready in %{public}.1f ms (cached: %{public}d)",
+            log: OSLog.quickLookExtension,
+            type: .info,
+            url.lastPathComponent,
+            (CFAbsoluteTimeGetCurrent() - start) * 1000,
+            isCached
+        )
 
         return html
     }

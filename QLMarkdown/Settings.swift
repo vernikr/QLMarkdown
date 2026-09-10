@@ -694,15 +694,8 @@ class Settings: Codable {
     func initFromDefaults() {
         if let s = Settings.settingsFromSharedFile() {
             update(from: s)
-            Self.revision += 1
         }
     }
-    
-    /// Revision of the settings, increased every time they are reloaded from the shared defaults.
-    ///
-    /// Clients that derive data from the settings (for example the rendered documents cache of
-    /// the Quick Look extension) can compare it to know when their own cache became stale.
-    private(set) static var revision = 0
     
     private(set) var isMonitoring = false
     /**
