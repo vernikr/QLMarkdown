@@ -47,15 +47,17 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     }
 
     override func viewDidDisappear() {
-        // This code will not be called on macOS 12 Monterey with QLIsDataBasedPreview set.
-
         self.launcherService = nil
     }
 
     override func loadView() {
-        // This code will not be called on macOS 12 Monterey with QLIsDataBasedPreview set.
-
         super.loadView()
+
+        // Paint the loading sheet with the current system appearance (dark in dark
+        // mode) instead of the default white, so the preview does not flash a white
+        // rectangle while the HTML is being generated and rendered.
+        self.view.wantsLayer = true
+        self.view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
         Settings.shared.startMonitorChange()
 
@@ -101,6 +103,16 @@ class PreviewViewController: NSViewController, QLPreviewingController {
 
         self.webView!.navigationDelegate = self
 
+        if #available(macOS 12.0, *) {
+            // Keep the themed background also around (and before) the rendered page.
+            self.webView?.underPageBackgroundColor = NSColor.windowBackgroundColor
+        }
+        // Do not draw a white webview background before the page paints: the HTML
+        // itself declares its own (theme-aware) background color.
+        if self.webView?.responds(to: Selector(("drawsBackground"))) == true {
+            self.webView?.setValue(false, forKey: "drawsBackground")
+        }
+
         self.view.addSubview(self.webView!)
     }
 
@@ -114,7 +126,8 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     }
 
     func preparePreviewOfFile(at url: URL, completionHandler handler: @escaping (Error?) -> Void) {
-        // This code will not be called on macOS 12 Monterey with QLIsDataBasedPreview set.
+        // View-based preview. This is the active path since QLIsDataBasedPreview is disabled
+        // (the extension paints the loading sheet itself).
 
         // Add the supported content types to the QLSupportedContentTypes array in the Info.plist of the extension.
 
@@ -133,7 +146,8 @@ class PreviewViewController: NSViewController, QLPreviewingController {
     }
 
     /// Provides HTML preview data for Quick Look.
-    /// This is the primary entry point on macOS 12+ when QLIsDataBasedPreview is set to true.
+    /// Entry point used on macOS 12+ only when QLIsDataBasedPreview is set to true
+    /// (currently disabled, see Info.plist).
     @available(macOSApplicationExtension 12.0, *)
     func providePreview(for request: QLFilePreviewRequest) async throws -> QLPreviewReply {
         Settings.shared.startMonitorChange()

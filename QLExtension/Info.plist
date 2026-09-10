@@ -26,8 +26,11 @@
 	<dict>
 		<key>NSExtensionAttributes</key>
 		<dict>
+			<!-- View-based preview: lets the extension paint the loading sheet with the
+			     current system appearance (dark in dark mode) instead of flashing white
+			     while the HTML is generated and rendered. -->
 			<key>QLIsDataBasedPreview</key>
-			<true/>
+			<false/>
 			<key>QLSupportedContentTypes</key>
 			<array>
 				<string>com.unknown.md</string>

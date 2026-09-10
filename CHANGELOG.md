@@ -1,5 +1,10 @@
 # Changelog
 
+### Unreleased
+Bugfix:
+- The Quick Look loading sheet now matches the system appearance (dark in dark mode) instead of flashing white while the preview is generated. The extension uses the view-based preview again (`QLIsDataBasedPreview` disabled) so the background can be themed by the extension itself.
+
+
 ### 1.5.3 (54)
 New Features:
 - Better default/auto window size (thanks to @ki7dk)
