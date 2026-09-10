@@ -22,6 +22,85 @@ class MyWKWebView: WKWebView {
     }
 }
 
+/**
+ * In-memory cache of the documents rendered by this process.
+ *
+ * Quick Look keeps the extension process alive between previews, and the same file is often
+ * previewed more than once (the panel is closed and reopened, or the user moves back and forth in
+ * the gallery). Parsing and highlighting the Markdown is by far the most expensive part of showing
+ * a preview, so the rendered body is reused while the source file and the settings are unchanged.
+ */
+final class RenderedBodyCache {
+    static let shared = RenderedBodyCache()
+    
+    /// Number of rendered documents kept in memory.
+    private let capacity = 8
+    /// Biggest body worth keeping (a few MB of HTML is already an unusually large document).
+    private let maxBodyLength = 4 << 20
+    
+    private struct Key: Equatable {
+        let path: String
+        let modified: Date?
+        let size: Int
+        let settingsRevision: Int
+        /// The system appearance, but only when the rendering depends on it (`renderAsCode`).
+        let lightAppearance: Bool?
+    }
+    
+    private struct Entry {
+        let key: Key
+        let body: String
+    }
+    
+    /// Entries ordered from the most to the least recently used.
+    private var entries: [Entry] = []
+    
+    /**
+     * Body of the last rendering of the file, or `nil` if the file must be rendered again.
+     */
+    func body(for url: URL, settings: Settings) -> String? {
+        let key = Self.key(for: url, settings: settings)
+        guard let index = entries.firstIndex(where: { $0.key == key }) else {
+            return nil
+        }
+        let entry = entries.remove(at: index)
+        entries.insert(entry, at: 0)
+        return entry.body
+    }
+    
+    /**
+     * Store the body rendered for the file, unless it is not worth (or not safe) to cache.
+     */
+    func store(body: String, for url: URL, settings: Settings) {
+        // A body with embedded local images is not cached: the images are not part of the cache
+        // key, so editing one of them would keep showing the old picture.
+        guard !body.contains("data:image/") else {
+            return
+        }
+        guard body.utf8.count <= maxBodyLength else {
+            return
+        }
+        
+        let key = Self.key(for: url, settings: settings)
+        entries.removeAll { $0.key == key }
+        entries.insert(Entry(key: key, body: body), at: 0)
+        if entries.count > capacity {
+            entries.removeLast(entries.count - capacity)
+        }
+    }
+    
+    private static func key(for url: URL, settings: Settings) -> Key {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        return Key(
+            path: url.path,
+            modified: values?.contentModificationDate,
+            size: values?.fileSize ?? -1,
+            settingsRevision: Settings.revision,
+            lightAppearance: settings.renderAsCode ? Settings.isLightAppearance : nil
+        )
+    }
+}
+
 class PreviewViewController: NSViewController, QLPreviewingController {
     var webView: MyWKWebView?
 
@@ -174,7 +253,19 @@ class PreviewViewController: NSViewController, QLPreviewingController {
         Settings.renderStats += 1
 
         let markdown_url = Settings.getMarkdownFile(from: url)
-        var text = try settings.render(file: markdown_url, baseDir: markdown_url.deletingLastPathComponent().path)
+        var text: String
+        if let cached = RenderedBodyCache.shared.body(for: markdown_url, settings: settings) {
+            os_log(
+                "Reusing the cached rendering of file %{public}s",
+                log: OSLog.quickLookExtension,
+                type: .info,
+                markdown_url.path
+            )
+            text = cached
+        } else {
+            text = try settings.render(file: markdown_url, baseDir: markdown_url.deletingLastPathComponent().path)
+            RenderedBodyCache.shared.store(body: text, for: markdown_url, settings: settings)
+        }
         
         if Settings.renderStats > 0 && Settings.renderStats % 100 == 0 {
             let icon: String

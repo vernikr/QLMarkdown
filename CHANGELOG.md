@@ -5,6 +5,7 @@ Bugfix:
 - The Quick Look loading sheet now matches the system appearance (dark in dark mode) instead of flashing white while the preview is generated. The extension uses the view-based preview again (`QLIsDataBasedPreview` disabled) so the background can be themed by the extension itself.
 
 Performance:
+- A preview of a document that has not changed since the last one is now instant: the extension keeps the rendered documents in memory (up to eight, invalidated when the file or the settings change) instead of parsing the Markdown again.
 - The `highlight` support folder and its `filetypes.conf` are now initialized once per process instead of on every rendering.
 - Documents without any code block skip the syntax highlight extension completely (no support folder scan, no post-processing walk, no highlight style lookup), so the first preview of a plain Markdown file is faster.
 - The bundled `default.css` is read from the app bundle only once per process.
